@@ -84,7 +84,8 @@ class GeoFirewallTests(unittest.TestCase):
                 raise TimeoutError("source timed out")
             return payload
         with mock.patch.object(geofw, "download_data", side_effect=download), \
-             mock.patch.object(geofw, "APNIC_MIRROR_URLS", ("https://mirror.test/cn",)):
+             mock.patch.object(geofw, "APNIC_MIRROR_URLS", ("https://mirror.test/cn",)), \
+             mock.patch.object(geofw, "today_cn_date", return_value=geofw.APNIC_MIRROR_DATE):
             cn4, cn6, source, source_date = geofw.fetch_apnic()
         self.assertEqual(calls, [(geofw.APNIC_URL, 30), ("https://mirror.test/cn", 20)])
         self.assertEqual(source_date, geofw.APNIC_MIRROR_DATE)
@@ -98,6 +99,33 @@ class GeoFirewallTests(unittest.TestCase):
              mock.patch.object(geofw, "APNIC_MIRROR_URLS", ("https://mirror.test/cn",)):
             with self.assertRaisesRegex(ValueError, "镜像快照 SHA-256 校验失败"):
                 geofw.fetch_apnic()
+
+    def test_stale_mirror_requires_choice_after_download(self):
+        payload = MIRROR_DATA.read_bytes()
+        with mock.patch.object(geofw, "download_data", side_effect=[TimeoutError("source timed out"),
+                                                                    payload]), \
+             mock.patch.object(geofw, "APNIC_MIRROR_URLS", ("https://mirror.test/cn",)), \
+             mock.patch.object(geofw, "today_cn_date", return_value="20990101"), \
+             mock.patch.object(geofw.sys.stdin, "isatty", return_value=True), \
+             mock.patch("builtins.input", return_value="yes") as confirmation:
+            self.assertEqual(geofw.fetch_apnic()[3], geofw.APNIC_MIRROR_DATE)
+            confirmation.assert_called_once()
+
+    def test_stale_mirror_noninteractive_needs_explicit_override(self):
+        payload = MIRROR_DATA.read_bytes()
+        with mock.patch.object(geofw, "download_data", side_effect=[TimeoutError("source timed out"),
+                                                                    payload]), \
+             mock.patch.object(geofw, "APNIC_MIRROR_URLS", ("https://mirror.test/cn",)), \
+             mock.patch.object(geofw, "today_cn_date", return_value="20990101"), \
+             mock.patch.object(geofw.sys.stdin, "isatty", return_value=False):
+            with self.assertRaisesRegex(ValueError, "--allow-stale-mirror"):
+                geofw.fetch_apnic()
+        with mock.patch.object(geofw, "download_data", side_effect=[TimeoutError("source timed out"),
+                                                                    payload]), \
+             mock.patch.object(geofw, "APNIC_MIRROR_URLS", ("https://mirror.test/cn",)), \
+             mock.patch.object(geofw, "today_cn_date", return_value="20990101"):
+            self.assertEqual(geofw.fetch_apnic(allow_stale_mirror=True)[3],
+                             geofw.APNIC_MIRROR_DATE)
 
     def test_allow_cn_blocks_other_new_ipv4_connections(self):
         table, comments = geofw.render_table([self.rule()], self.cn4, self.cn6)

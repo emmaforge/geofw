@@ -1,0 +1,35 @@
+name: 同步 APNIC 中国网段快照
+
+on:
+  schedule:
+    - cron: '17 * * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: 检查 APNIC 当天数据
+        run: python3 tools/sync_apnic.py
+      - name: 发布当天快照与日期标签
+        shell: bash
+        run: |
+          set -euo pipefail
+          snapshot_date=$(python3 -c 'import pathlib,re; print(re.search(r"APNIC_MIRROR_DATE = \"(\d{8})\"", pathlib.Path("geofw").read_text()).group(1))')
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          if ! git diff --quiet -- geofw data/apnic-cn.txt; then
+            git add geofw data/apnic-cn.txt
+            git commit -m "Update APNIC CN snapshot for ${snapshot_date}"
+          fi
+          if ! git rev-parse --verify --quiet "refs/tags/apnic-${snapshot_date}" >/dev/null; then
+            git tag "apnic-${snapshot_date}"
+          fi
+          git push origin HEAD:main
+          git push origin "refs/tags/apnic-${snapshot_date}"

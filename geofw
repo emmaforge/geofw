@@ -20,12 +20,14 @@ import urllib.request
 
 TABLE = "geofw_managed"
 APNIC_URL = "https://ftp.apnic.net/stats/apnic/delegated-apnic-latest"
+APNIC_MIRROR_DATE = "20261031"
+APNIC_MIRROR_RAW = ("https://raw.githubusercontent.com/zzx327317-creator/geofw/"
+                    f"apnic-{APNIC_MIRROR_DATE}/data/apnic-cn.txt")
 APNIC_MIRROR_URLS = (
-    "https://gh-proxy.com/https://raw.githubusercontent.com/zzx327317-creator/geofw/main/data/apnic-cn.txt",
-    "https://gh-proxy.org/https://raw.githubusercontent.com/zzx327317-creator/geofw/main/data/apnic-cn.txt",
+    "https://gh-proxy.com/" + APNIC_MIRROR_RAW,
+    "https://gh-proxy.org/" + APNIC_MIRROR_RAW,
 )
 APNIC_MIRROR_SHA256 = "bfff7598854375bdc1442e0cc908ca6877196f7a86098673c34fcf29e638bff8"
-APNIC_MIRROR_DATE = "20261031"
 CONFIG_DIR = Path(os.environ.get("GEOFW_CONFIG_DIR", "/etc/geofw"))
 DATA_DIR = Path(os.environ.get("GEOFW_DATA_DIR", "/var/lib/geofw"))
 LOCK_PATH = Path(os.environ.get("GEOFW_LOCK_PATH", "/run/lock/geofw.lock"))
@@ -457,7 +459,12 @@ def download_data(url, max_seconds, max_bytes):
     return b"".join(chunks)
 
 
-def fetch_apnic():
+def today_cn_date():
+    return dt.datetime.now(dt.timezone(dt.timedelta(hours=8))).strftime("%Y%m%d")
+
+
+def fetch_apnic(allow_stale_mirror=False):
+    allow_stale_mirror = allow_stale_mirror or os.environ.get("GEOFW_ALLOW_STALE_MIRROR") == "1"
     try:
         payload = download_data(APNIC_URL, 30, 20_000_000)
         cn4, cn6 = parse_full_apnic(payload.decode("ascii"))
@@ -471,15 +478,25 @@ def fetch_apnic():
             if hashlib.sha256(payload).hexdigest() != APNIC_MIRROR_SHA256:
                 fail("镜像快照 SHA-256 校验失败。")
             cn4, cn6 = parse_apnic(payload.decode("ascii"))
-            return cn4, cn6, mirror, APNIC_MIRROR_DATE
         except (OSError, ValueError, UnicodeError) as exc:
             errors.append(f"{mirror}: {exc}")
+            continue
+        today = today_cn_date()
+        if APNIC_MIRROR_DATE != today and not allow_stale_mirror:
+            message = (f"当天 {today} 的镜像不可用；已下载并校验 "
+                       f"{APNIC_MIRROR_DATE} 的历史网段快照。")
+            if not sys.stdin.isatty():
+                fail(message + "非交互运行请使用 --allow-stale-mirror 明确允许回退。")
+            print(message, file=sys.stderr)
+            if input("是否回退使用该日期？输入 yes 确认：").strip() != "yes":
+                fail("已取消使用历史网段快照。")
+        return cn4, cn6, mirror, APNIC_MIRROR_DATE
     fail("APNIC 源站和加速镜像均不可用；" + "；".join(errors))
 
 
-def geo_update():
+def geo_update(allow_stale_mirror=False):
     with locked():
-        cn4, cn6, source, source_date = fetch_apnic()
+        cn4, cn6, source, source_date = fetch_apnic(allow_stale_mirror)
         rules = read_rules()
         old_geo = None
         try:
@@ -688,7 +705,9 @@ def main():
     delete.add_argument("id", type=int)
     sub.add_parser("list", help="查看配置和状态")
     sub.add_parser("apply", help="核对并修复规则")
-    sub.add_parser("geo-update", help="从 APNIC 更新国内网段")
+    update = sub.add_parser("geo-update", help="从 APNIC 更新国内网段")
+    update.add_argument("--allow-stale-mirror", action="store_true",
+                        help="非交互运行时明确允许使用程序内置日期的历史镜像")
     args = parser.parse_args()
     require_root()
     try:
@@ -705,7 +724,7 @@ def main():
             with locked():
                 apply_rules(read_rules(), *read_geo())
         elif args.command == "geo-update":
-            geo_update()
+            geo_update(args.allow_stale_mirror)
     except (ValueError, OSError, subprocess.SubprocessError) as exc:
         print(f"错误：{exc}", file=sys.stderr)
         return 1

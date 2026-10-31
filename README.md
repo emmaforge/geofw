@@ -20,7 +20,9 @@ wget -qO /tmp/install-geofw.sh https://raw.githubusercontent.com/zzx327317-creat
 
 安装脚本会安装缺失的 Python 3 / nftables，下载程序和 APNIC 中国网段，建立开机服务，随后打开面板。也可下载仓库后在目录内运行 `bash install.sh`。安装失败时不会启用开机服务。
 
-网段优先从 APNIC 官方源站获取，最多等待 **30 秒**；源站超时或失败时，自动通过 `gh-proxy.com`、`gh-proxy.org` 读取本仓库的 **APNIC CN 网段快照**。镜像文件使用固定 SHA-256 校验，不接受被修改的内容。镜像是仓库内的固定快照（当前 APNIC 数据日期 `2026-10-31`），不是实时 APNIC 数据；以后运行 `geofw geo-update` 仍会先尝试官方源站。两个镜像都不可用时会明确报错，不会用空网段覆盖规则。
+网段优先从 APNIC 官方源站获取，最多等待 **30 秒**；源站超时或失败时，自动通过 `gh-proxy.com`、`gh-proxy.org` 读取本仓库带日期标签的 **APNIC CN 网段快照**。镜像文件使用程序内的 SHA-256 校验，不接受被修改的内容。仓库的 GitHub Actions **每小时检查一次** APNIC，发现当天数据后更新快照、校验值和日期标签；它不是逐秒实时的，任务延迟或 APNIC 当天数据尚未发布时，仓库可能仍是上一日期。重新运行安装脚本会取得最新程序及其快照日期。
+
+若源站失败且程序只能下载到旧日期的已校验快照，交互运行时会显示日期并询问是否回退；输入 `yes` 才使用。非交互运行默认拒绝旧快照，可通过 `geofw geo-update --allow-stale-mirror`，或安装时设置 `GEOFW_ALLOW_STALE_MIRROR=1`，明确允许回退。镜像不可用时会报错，不会用空网段覆盖规则。
 
 以后输入 `geofw` 即可打开面板；`geofw list` 查看配置，`geofw apply` 手动核对并修复，`geofw geo-update` 手动更新国内网段。systemd 系统每 10 分钟核对一次当前规则；**不会自动更新地域网段或自动删除规则**。OpenRC 系统在开机时核对，防火墙服务重载后可手动运行 `geofw apply`。
 
