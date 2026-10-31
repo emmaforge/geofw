@@ -1,6 +1,6 @@
 # geofw · 双栈地域防火墙面板
 
-独立的 Linux 防火墙管理项目，**不修改 Xboard、V2bX 或 hopctl 的代码**。输入 `geofw` 打开中文交互面板，可按 IPv4 / IPv6 / 双栈、入站 / 出站 / 双向、TCP / UDP / 两者、单端口 / 多端口 / 端口范围，以及国内 / 国外 / 全部地址创建放行或阻断规则。支持按编号删除、重启恢复和重复运行核对。主要适配 Debian，也支持使用 systemd 的 Ubuntu、Fedora、RHEL 系、Arch、openSUSE，以及使用 OpenRC 的 Alpine。
+独立的 Linux 防火墙管理项目，**不修改 Xboard、V2bX 或 hopctl 的代码**。输入 `geofw` 打开中文交互面板，可按 IPv4 / IPv6 / 双栈或指定域名/IP、入站 / 出站 / 双向、TCP / UDP / 两者、单端口 / 多端口 / 端口范围，以及国内 / 国外 / 全部地址创建放行或阻断规则。支持按编号删除、重启恢复和重复运行核对。主要适配 Debian，也支持使用 systemd 的 Ubuntu、Fedora、RHEL 系、Arch、openSUSE，以及使用 OpenRC 的 Alpine。
 
 ## 一键安装
 
@@ -31,6 +31,15 @@ wget -qO /tmp/install-geofw.sh https://raw.githubusercontent.com/zzx327317-creat
 - 规则只作用于指定的地址族、方向、协议和目标端口，不改变系统默认策略。已经建立的连接不被新规则中断。对于相同地址族、方向、协议和重叠端口，面板拒绝创建互相遮蔽的规则。
 - `放行` 仅表示 geofw 自己的规则允许通过；若云安全组或其他防火墙仍在阻断，该连接仍可能失败。
 
+### 指定域名或 IP
+
+添加规则时，在第一个“地址族”菜单选 `[4] 指定域名/IP`，再填写完整域名、单个 IPv4/IPv6 地址或 CIDR 网段。IP/CIDR 自动识别地址族；域名使用当前 DNS 解析出的 A/AAAA 地址。此时无需再选国内/国外。
+
+- 入站按**连接来源地址**匹配，出站按**连接目的地址**匹配；两者都可与目标端口、TCP/UDP 组合。
+- `阻断`只拦截该地址或域名当前解析出的地址。`放行`允许这些地址，同时阻断该端口的其他公网新连接；内网及保留地址仍交给已有防火墙。若域名只有 A 记录，选择放行时该端口的其他公网 IPv6 来源/目的地址也会被阻断。
+- 域名在每次 `geofw apply` 时重新解析。systemd 系统每 10 分钟自动核对并更新变动的解析结果；OpenRC 系统在开机时核对，也可手动运行 `geofw apply`。DNS 解析失败时保留已有规则，不用空结果覆盖。
+- 匹配的是 DNS 解析后的 **IP 地址**，不是网页域名、HTTP Host 或 TLS SNI。CDN 共享 IP、DNS 轮询和解析位置差异可能影响匹配范围。
+
 例如只允许国内 IPv4 访问服务器 TCP 80：在面板依次选择 `IPv4 → 入站 → TCP → 80 → 仅国内 → 放行`。非国内来源的新连接会被 geofw 阻断。多端口输入示例：`80,443,2000-2999`。
 
 命令行也可添加或清理：
@@ -38,6 +47,8 @@ wget -qO /tmp/install-geofw.sh https://raw.githubusercontent.com/zzx327317-creat
 ```bash
 geofw add --family ipv4 --direction in --protocol tcp --ports 80 --geo cn --action allow
 geofw add --family dual --direction out --protocol both --ports 80,443,2000-2999 --geo foreign --action block
+geofw add --family ipv4 --direction in --protocol tcp --ports 22 --geo target --target 203.0.113.7 --action allow
+geofw add --family dual --direction out --protocol tcp --ports 443 --geo target --target example.com --action block
 geofw list
 geofw delete 2
 geofw apply

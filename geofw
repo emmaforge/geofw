@@ -11,6 +11,7 @@ import os
 from pathlib import Path
 import re
 import shutil
+import socket
 import subprocess
 import sys
 import tempfile
@@ -27,7 +28,7 @@ GEO_PATH = DATA_DIR / "cn.json"
 FAMILIES = {"ipv4": (4,), "ipv6": (6,), "dual": (4, 6)}
 DIRECTIONS = {"in": ("input",), "out": ("output",), "both": ("input", "output")}
 PROTOCOLS = {"tcp": ("tcp",), "udp": ("udp",), "both": ("tcp", "udp")}
-GEO = {"cn": "国内", "foreign": "国外", "all": "全部"}
+GEO = {"cn": "国内", "foreign": "国外", "all": "全部", "target": "指定域名/IP"}
 ACTIONS = {"allow": "放行", "block": "阻断"}
 NONPUBLIC4 = ("0.0.0.0/8", "10.0.0.0/8", "100.64.0.0/10", "127.0.0.0/8",
               "169.254.0.0/16", "172.16.0.0/12", "192.0.0.0/24", "192.0.2.0/24",
@@ -112,6 +113,54 @@ def port_expr(intervals):
     return parts[0] if len(parts) == 1 else "{ " + ", ".join(parts) + " }"
 
 
+def normalize_target(value):
+    if not isinstance(value, str) or not value.strip():
+        fail("指定域名/IP 不能为空。")
+    value = value.strip()
+    try:
+        network = ipaddress.ip_network(value, strict=False)
+    except ValueError:
+        if "/" in value or any(char.isspace() for char in value):
+            fail("指定域名/IP 格式无效。")
+        try:
+            hostname = value.rstrip(".").encode("idna").decode("ascii").lower()
+        except UnicodeError:
+            fail("域名编码无效。")
+        labels = hostname.split(".")
+        if (len(hostname) > 253 or len(labels) < 2 or
+                any(not re.fullmatch(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?", label)
+                    for label in labels)):
+            fail("域名格式无效，请填写完整域名或 IP/CIDR。")
+        return hostname
+    return (str(network.network_address) if network.prefixlen == network.max_prefixlen
+            else str(network))
+
+
+def resolve_target(rule):
+    target = rule["target"]
+    try:
+        network = ipaddress.ip_network(target, strict=False)
+    except ValueError:
+        try:
+            records = socket.getaddrinfo(target, None, type=socket.SOCK_STREAM)
+        except OSError as exc:
+            fail(f"域名 {target} 解析失败：{exc}；保留当前防火墙规则。")
+        addresses = {4: set(), 6: set()}
+        for family, _, _, _, sockaddr in records:
+            if family in (socket.AF_INET, socket.AF_INET6):
+                address = ipaddress.ip_address(sockaddr[0])
+                addresses[address.version].add(str(address))
+        if sum(map(len, addresses.values())) > 128:
+            fail(f"域名 {target} 返回过多地址，拒绝应用。")
+        result = {version: sorted(addresses[version], key=ipaddress.ip_address)
+                  for version in FAMILIES[rule["family"]]}
+    else:
+        result = {network.version: [target]}
+    if not any(result.get(version) for version in FAMILIES[rule["family"]]):
+        fail(f"指定目标 {target} 没有所选地址族的解析结果。")
+    return result
+
+
 def normalize_rule(rule):
     if not isinstance(rule, dict) or not isinstance(rule.get("id"), int) or rule["id"] < 1:
         fail("规则编号无效。")
@@ -121,7 +170,19 @@ def normalize_rule(rule):
             fail(f"规则 #{rule['id']} 的 {field} 无效。")
     rule = dict(rule)
     rule["ports"] = port_text(parse_ports(rule.get("ports")))
-    return {key: rule[key] for key in ("id", "family", "direction", "protocol", "ports", "geo", "action")}
+    if rule["geo"] == "target":
+        rule["target"] = normalize_target(rule.get("target"))
+        try:
+            version = ipaddress.ip_network(rule["target"], strict=False).version
+        except ValueError:
+            pass
+        else:
+            if FAMILIES[rule["family"]] != (version,):
+                fail(f"指定 IP 属于 IPv{version}；请选择对应的单一地址族。")
+    elif rule.get("target") is not None:
+        fail("仅在选择指定域名/IP 时填写 target。")
+    keys = ("id", "family", "direction", "protocol", "ports", "geo", "action")
+    return {key: rule[key] for key in keys + (("target",) if rule["geo"] == "target" else ())}
 
 
 def overlap(left, right):
@@ -214,9 +275,16 @@ def read_geo():
 
 def render_table(rules, cn4, cn6):
     rules = validate_rules(rules)
+    target_sets = {}
+    for rule in rules:
+        if rule["geo"] == "target":
+            for version, addresses in resolve_target(rule).items():
+                if addresses:
+                    target_sets[f"target_{rule['id']}_{version}"] = (version, addresses)
     geo_hash = hashlib.sha256(("\n".join(cn4) + "\n--\n" + "\n".join(cn6) +
                                "\n--\n" + "\n".join(NONPUBLIC4 + NONPUBLIC6)).encode()).hexdigest()
-    revision = hashlib.sha256((json.dumps(rules, sort_keys=True) + geo_hash).encode()).hexdigest()[:20]
+    revision = hashlib.sha256((json.dumps(rules, sort_keys=True) + geo_hash +
+                               json.dumps(target_sets, sort_keys=True)).encode()).hexdigest()[:20]
     chains = {"input": [], "output": []}
     comments = {"input": [], "output": []}
     for chain in chains:
@@ -234,6 +302,7 @@ def render_table(rules, cn4, cn6):
                 for version in FAMILIES[rule["family"]]:
                     ip_family = "ip" if version == 4 else "ip6"
                     set_name = "cn4" if version == 4 else "cn6"
+                    target_name = f"target_{rule['id']}_{version}"
                     base = f"{proto} dport {ports}"
                     match = f"{ip_family} {address} @{set_name}"
                     foreign = (f"{ip_family} {address} != @{set_name} "
@@ -242,6 +311,16 @@ def render_table(rules, cn4, cn6):
                     prefix = f"geofw:rule:{rule['id']}:{chain}:{proto}:{version}"
                     if rule["geo"] == "all":
                         specs = [(fallback, rule["action"])]
+                    elif rule["geo"] == "target":
+                        if target_name in target_sets:
+                            specific = f"{ip_family} {address} @{target_name}"
+                            other = (f"{ip_family} {address} != @{target_name} "
+                                     f"{ip_family} {address} != @local{version}")
+                            specs = ([(specific, "allow"), (other, "block")]
+                                     if rule["action"] == "allow" else [(specific, "block")])
+                        else:
+                            specs = ([(f"{ip_family} {address} != @local{version}", "block")]
+                                     if rule["action"] == "allow" else [])
                     elif rule["action"] == "allow":
                         specs = ([(match, "allow"), (foreign, "block")]
                                  if rule["geo"] == "cn" else
@@ -260,6 +339,8 @@ def render_table(rules, cn4, cn6):
              set_block("cn6", "ipv6_addr", cn6),
              set_block("local4", "ipv4_addr", NONPUBLIC4),
              set_block("local6", "ipv6_addr", NONPUBLIC6)]
+    for name, (version, addresses) in target_sets.items():
+        lines.append(set_block(name, "ipv4_addr" if version == 4 else "ipv6_addr", addresses))
     for chain in ("input", "output"):
         body = "\n".join(chains[chain])
         lines.append(f"  chain {chain} {{\n    type filter hook {chain} priority -10; policy accept;\n{body}\n  }}")
@@ -372,11 +453,16 @@ def format_rule(rule):
     direction = {"in": "入站", "out": "出站", "both": "双向"}[rule["direction"]]
     protocol = {"tcp": "TCP", "udp": "UDP", "both": "TCP+UDP"}[rule["protocol"]]
     action = ACTIONS[rule["action"]]
-    if rule["action"] == "allow" and rule["geo"] != "all":
-        action += "（其他地域阻断）"
+    if rule["action"] == "allow":
+        if rule["geo"] == "target":
+            action += "（其他公网地址阻断）"
+        elif rule["geo"] != "all":
+            action += "（其他地域阻断）"
+    selector = (f"       指定地址：{rule['target']}" if rule["geo"] == "target" else
+                f"       匹配地域：{GEO[rule['geo']]}")
     return (f"  [#{rule['id']}] {family} / {direction} / {protocol}\n"
             f"       目标端口：{rule['ports']}\n"
-            f"       匹配地域：{GEO[rule['geo']]}\n"
+            f"{selector}\n"
             f"       执行动作：{action}")
 
 
@@ -413,9 +499,10 @@ def show_rules():
     print("=" * 34)
 
 
-def add_rule(family, direction, protocol, ports, geo, action):
+def add_rule(family, direction, protocol, ports, geo, action, target=None):
     new = normalize_rule({"id": 1, "family": family, "direction": direction,
-                          "protocol": protocol, "ports": ports, "geo": geo, "action": action})
+                          "protocol": protocol, "ports": ports, "geo": geo,
+                          "action": action, "target": target})
     def candidate(before):
         equivalent = [{key: value for key, value in old.items() if key != "id"} ==
                       {key: value for key, value in new.items() if key != "id"} for old in before]
@@ -449,7 +536,8 @@ def choice(label, mapping):
 
 
 def menu():
-    families = {"1": ("IPv4", "ipv4"), "2": ("IPv6", "ipv6"), "3": ("双栈", "dual")}
+    families = {"1": ("IPv4", "ipv4"), "2": ("IPv6", "ipv6"),
+                "3": ("双栈", "dual"), "4": ("指定域名/IP", "target")}
     directions = {"1": ("入站", "in"), "2": ("出站", "out"), "3": ("双向", "both")}
     protocols = {"1": ("TCP", "tcp"), "2": ("UDP", "udp"), "3": ("两者", "both")}
     regions = {"1": ("仅国内", "cn"), "2": ("仅国外", "foreign"), "3": ("全部地址", "all")}
@@ -470,27 +558,42 @@ def menu():
             if option == "0":
                 return
             if option == "1":
-                family = choice("地址族", families)
+                selection = choice("地址族", families)
+                target = None
+                if selection == "target":
+                    target = normalize_target(input("填写域名、IP 或 CIDR："))
+                    try:
+                        version = ipaddress.ip_network(target, strict=False).version
+                    except ValueError:
+                        family = "dual"
+                    else:
+                        family = "ipv4" if version == 4 else "ipv6"
+                    geo = "target"
+                else:
+                    family = selection
                 direction = choice("方向", directions)
                 protocol = choice("协议", protocols)
                 ports = port_text(parse_ports(input("目标端口（如 80,443,2000-2999）：")))
-                geo = choice("地域", regions)
+                if target is None:
+                    geo = choice("地域", regions)
                 action = choice("动作", actions)
                 preview = normalize_rule({"id": 1, "family": family, "direction": direction,
-                                          "protocol": protocol, "ports": ports, "geo": geo, "action": action})
+                                          "protocol": protocol, "ports": ports, "geo": geo,
+                                          "action": action, "target": target})
                 print("\n" + "-" * 34)
                 print(paint("  请确认以下规则", "1;36"))
                 print(format_rule(preview))
                 print("-" * 34)
                 if action == "allow" and geo != "all":
-                    print("提示：其他地域的新连接会被阻断。")
+                    print("提示：其他公网地址的新连接会被阻断。" if geo == "target" else
+                          "提示：其他地域的新连接会被阻断。")
                 if direction in ("in", "both") and protocol in ("tcp", "both"):
                     ssh_parts = os.environ.get("SSH_CONNECTION", "").split()
                     ssh_port = int(ssh_parts[-1]) if len(ssh_parts) == 4 and ssh_parts[-1].isdigit() else 22
                     if any(a <= ssh_port <= b for a, b in parse_ports(ports)):
                         print(paint("警告：规则涉及 SSH 端口，可能阻断新的远程登录。", "1;33"))
                 if input("确认应用？输入 yes：").strip() == "yes":
-                    add_rule(family, direction, protocol, ports, geo, action)
+                    add_rule(family, direction, protocol, ports, geo, action, target)
                 else:
                     print("已取消。")
             elif option == "2":
@@ -524,6 +627,7 @@ def main():
                           ("protocol", PROTOCOLS), ("geo", GEO), ("action", ACTIONS)):
         add.add_argument(f"--{name}", required=True, choices=choices)
     add.add_argument("--ports", required=True, help="目标端口，如 80,443,2000-2999")
+    add.add_argument("--target", help="指定域名、IP 或 CIDR；--geo target 时必填")
     delete = sub.add_parser("delete", help="删除指定编号")
     delete.add_argument("id", type=int)
     sub.add_parser("list", help="查看配置和状态")
@@ -535,7 +639,8 @@ def main():
         if args.command in (None, "menu"):
             menu()
         elif args.command == "add":
-            add_rule(args.family, args.direction, args.protocol, args.ports, args.geo, args.action)
+            add_rule(args.family, args.direction, args.protocol, args.ports,
+                     args.geo, args.action, args.target)
         elif args.command == "delete":
             delete_rule(args.id)
         elif args.command == "list":

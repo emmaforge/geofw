@@ -4,6 +4,7 @@ import hashlib
 import io
 import json
 from pathlib import Path
+import socket
 import tempfile
 import unittest
 from contextlib import redirect_stdout
@@ -71,6 +72,52 @@ class GeoFirewallTests(unittest.TestCase):
         self.assertIn("udp dport 443 ip6 daddr != @cn6 ip6 daddr != @local6 counter drop", table)
         self.assertNotIn("udp dport 443 ip6 daddr != @cn6 ip6 daddr != @local6 counter accept", table)
 
+    def test_target_ip_validation_and_rendering(self):
+        rule = self.rule(geo="target", target="203.0.113.7")
+        table, _ = geofw.render_table([rule], self.cn4, self.cn6)
+        self.assertIn("set target_1_4", table)
+        self.assertIn("203.0.113.7", table)
+        self.assertIn("tcp dport 80 ip saddr @target_1_4 counter accept", table)
+        self.assertIn("ip saddr != @target_1_4 ip saddr != @local4 counter drop", table)
+        for invalid in (self.rule(geo="target"),
+                        self.rule(geo="target", target="example.com/24"),
+                        self.rule(family="dual", geo="target", target="203.0.113.7"),
+                        self.rule(target="example.com")):
+            with self.subTest(invalid=invalid), self.assertRaises(ValueError):
+                geofw.normalize_rule(invalid)
+
+    def test_domain_addresses_change_rule_revision(self):
+        rule = self.rule(family="dual", direction="out", geo="target",
+                         target="Example.COM.", action="block")
+        first_records = [(socket.AF_INET, None, None, None, ("203.0.113.7", 0)),
+                         (socket.AF_INET6, None, None, None, ("2001:db8::7", 0, 0, 0))]
+        second_records = [(socket.AF_INET, None, None, None, ("203.0.113.8", 0))]
+        with mock.patch.object(geofw.socket, "getaddrinfo", return_value=first_records):
+            first, first_comments = geofw.render_table([rule], self.cn4, self.cn6)
+        with mock.patch.object(geofw.socket, "getaddrinfo", return_value=second_records):
+            second, second_comments = geofw.render_table([rule], self.cn4, self.cn6)
+        self.assertIn("ip daddr @target_1_4 counter drop", first)
+        self.assertIn("ip6 daddr @target_1_6 counter drop", first)
+        self.assertNotIn("set target_1_6", second)
+        self.assertNotEqual(first_comments[0], second_comments[0])
+
+    def test_allow_domain_without_aaaa_blocks_other_public_ipv6(self):
+        rule = self.rule(family="dual", geo="target", target="example.com")
+        records = [(socket.AF_INET, None, None, None, ("203.0.113.7", 0))]
+        with mock.patch.object(geofw.socket, "getaddrinfo", return_value=records):
+            table, _ = geofw.render_table([rule], self.cn4, self.cn6)
+        self.assertIn("tcp dport 80 ip6 saddr != @local6 counter drop", table)
+        self.assertNotIn("set target_1_6", table)
+
+    def test_domain_resolution_error_keeps_existing_table(self):
+        rule = self.rule(geo="target", target="example.com")
+        with mock.patch.object(geofw.socket, "getaddrinfo", side_effect=socket.gaierror("DNS down")), \
+             mock.patch.object(geofw.shutil, "which", return_value="/usr/sbin/nft"), \
+             mock.patch.object(geofw.subprocess, "run") as run:
+            with self.assertRaisesRegex(ValueError, "保留当前防火墙规则"):
+                geofw.apply_rules([rule], self.cn4, self.cn6)
+            run.assert_not_called()
+
     def test_snapshot_detects_missing_rules_and_sets(self):
         _, comments = geofw.render_table([self.rule()], self.cn4, self.cn6)
         entries = [{"set": {"name": "cn4", "elem": ["1.0.0.0/24"]}},
@@ -109,6 +156,14 @@ class GeoFirewallTests(unittest.TestCase):
         card = geofw.format_rule(self.rule())
         self.assertIn("  [#1] IPv4 / 入站 / TCP", card)
         self.assertIn("执行动作：放行（其他地域阻断）", card)
+
+    def test_specific_address_option_is_in_family_menu(self):
+        output = io.StringIO()
+        choices = ["1", "4", "203.0.113.7", "1", "1", "80", "2", "no", "0"]
+        with mock.patch("builtins.input", side_effect=choices), redirect_stdout(output):
+            geofw.menu()
+        self.assertIn("[4] 指定域名/IP", output.getvalue())
+        self.assertIn("指定地址：203.0.113.7", output.getvalue())
 
     def test_geo_cache_rejects_corruption(self):
         checksum = hashlib.sha256(("\n".join(self.cn4) + "\n--\n" +
