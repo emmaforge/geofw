@@ -1,6 +1,6 @@
 # geofw · 双栈地域防火墙面板
 
-独立的 Linux 防火墙管理项目，**不修改 hopctl 的代码**。输入 `geofw` 打开中文交互面板，可按 IPv4 / IPv6 / 双栈或指定域名/IP、入站 / 出站 / 双向、TCP / UDP / 两者、单端口 / 多端口 / 端口范围，以及国内 / 国外 / 全部地址创建放行或阻断规则。支持按编号删除、重启恢复和重复运行核对。主要适配 Debian，也支持使用 systemd 的 Ubuntu、Fedora、RHEL 系、Arch、openSUSE，以及使用 OpenRC 的 Alpine。
+独立的 Linux 防火墙管理项目。输入 `geofw` 打开中文交互面板，可按 IPv4 / IPv6 / 双栈或指定域名/IP、入站 / 出站 / 双向、TCP / UDP / 两者、单端口 / 多端口 / 端口范围，以及国内 / 国外 / 全部地址创建放行或阻断规则。支持按编号删除、重启恢复和重复运行核对。主要适配 Debian，也支持使用 systemd 的 Ubuntu、Fedora、RHEL 系、Arch、openSUSE，以及使用 OpenRC 的 Alpine。
 
 ## 一键安装
 
