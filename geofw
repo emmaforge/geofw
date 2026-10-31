@@ -15,10 +15,17 @@ import socket
 import subprocess
 import sys
 import tempfile
+import time
 import urllib.request
 
 TABLE = "geofw_managed"
 APNIC_URL = "https://ftp.apnic.net/stats/apnic/delegated-apnic-latest"
+APNIC_MIRROR_URLS = (
+    "https://gh-proxy.com/https://raw.githubusercontent.com/zzx327317-creator/geofw/main/data/apnic-cn.txt",
+    "https://gh-proxy.org/https://raw.githubusercontent.com/zzx327317-creator/geofw/main/data/apnic-cn.txt",
+)
+APNIC_MIRROR_SHA256 = "bfff7598854375bdc1442e0cc908ca6877196f7a86098673c34fcf29e638bff8"
+APNIC_MIRROR_DATE = "20261031"
 CONFIG_DIR = Path(os.environ.get("GEOFW_CONFIG_DIR", "/etc/geofw"))
 DATA_DIR = Path(os.environ.get("GEOFW_DATA_DIR", "/var/lib/geofw"))
 LOCK_PATH = Path(os.environ.get("GEOFW_LOCK_PATH", "/run/lock/geofw.lock"))
@@ -247,6 +254,18 @@ def parse_apnic(text):
     return [str(net) for net in v4], [str(net) for net in v6]
 
 
+def parse_full_apnic(text):
+    lines = text.splitlines()
+    header = next((line.split("|") for line in lines if line.startswith("2|apnic|")), None)
+    if not header or len(header) < 4:
+        fail("APNIC 源站数据缺少记录总数。")
+    expected = int(header[3])
+    actual = sum(line.startswith("apnic|") and not line.endswith("|summary") for line in lines)
+    if actual != expected:
+        fail(f"APNIC 源站数据不完整：应有 {expected} 条，实际 {actual} 条。")
+    return parse_apnic(text)
+
+
 def read_geo():
     if not GEO_PATH.exists():
         fail("尚无国内网段数据；先运行 geofw geo-update。")
@@ -419,14 +438,48 @@ def update_rules(candidate):
         return True
 
 
+def download_data(url, max_seconds, max_bytes):
+    request = urllib.request.Request(url, headers={"User-Agent": "geofw/1.0"})
+    deadline = time.monotonic() + max_seconds
+    chunks = []
+    size = 0
+    with urllib.request.urlopen(request, timeout=8) as response:
+        while True:
+            if time.monotonic() >= deadline:
+                fail(f"下载超过 {max_seconds} 秒。")
+            chunk = response.read(64 * 1024)
+            if not chunk:
+                break
+            size += len(chunk)
+            if size > max_bytes:
+                fail("下载内容超过预期大小。")
+            chunks.append(chunk)
+    return b"".join(chunks)
+
+
+def fetch_apnic():
+    try:
+        payload = download_data(APNIC_URL, 30, 20_000_000)
+        cn4, cn6 = parse_full_apnic(payload.decode("ascii"))
+        return cn4, cn6, APNIC_URL, None
+    except (OSError, ValueError, UnicodeError) as exc:
+        print(f"APNIC 源站不可用（{exc}），尝试加速镜像...", file=sys.stderr)
+    errors = []
+    for mirror in APNIC_MIRROR_URLS:
+        try:
+            payload = download_data(mirror, 20, 1_000_000)
+            if hashlib.sha256(payload).hexdigest() != APNIC_MIRROR_SHA256:
+                fail("镜像快照 SHA-256 校验失败。")
+            cn4, cn6 = parse_apnic(payload.decode("ascii"))
+            return cn4, cn6, mirror, APNIC_MIRROR_DATE
+        except (OSError, ValueError, UnicodeError) as exc:
+            errors.append(f"{mirror}: {exc}")
+    fail("APNIC 源站和加速镜像均不可用；" + "；".join(errors))
+
+
 def geo_update():
     with locked():
-        request = urllib.request.Request(APNIC_URL, headers={"User-Agent": "geofw/1.0"})
-        with urllib.request.urlopen(request, timeout=30) as response:
-            payload = response.read(20_000_001)
-        if len(payload) > 20_000_000:
-            fail("APNIC 文件超过预期大小，拒绝更新。")
-        cn4, cn6 = parse_apnic(payload.decode("ascii"))
+        cn4, cn6, source, source_date = fetch_apnic()
         rules = read_rules()
         old_geo = None
         try:
@@ -437,15 +490,18 @@ def geo_update():
         try:
             checksum = hashlib.sha256(("\n".join(cn4) + "\n--\n" +
                                        "\n".join(cn6)).encode()).hexdigest()
-            meta = {"source": APNIC_URL, "updated_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+            meta = {"source": source, "updated_at": dt.datetime.now(dt.timezone.utc).isoformat(),
                     "ipv4_prefixes": len(cn4), "ipv6_prefixes": len(cn6), "sha256": checksum}
+            if source_date:
+                meta["source_date"] = source_date
             atomic_text(GEO_PATH, json.dumps({"meta": meta, "cn4": cn4, "cn6": cn6},
                                              ensure_ascii=False, separators=(",", ":")) + "\n")
         except Exception:
             if old_geo:
                 apply_rules(rules, *old_geo, quiet=True)
             raise
-        print(f"国内网段已更新：IPv4 {len(cn4)} 条，IPv6 {len(cn6)} 条。")
+        label = (f"加速镜像快照（APNIC 日期 {source_date}）" if source_date else "APNIC 源站")
+        print(f"国内网段已从{label}更新：IPv4 {len(cn4)} 条，IPv6 {len(cn6)} 条。")
 
 
 def format_rule(rule):

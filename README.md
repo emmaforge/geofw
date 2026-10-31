@@ -18,7 +18,9 @@ curl -fsSLo /tmp/install-geofw.sh https://raw.githubusercontent.com/zzx327317-cr
 wget -qO /tmp/install-geofw.sh https://raw.githubusercontent.com/zzx327317-creator/geofw/main/install.sh && bash /tmp/install-geofw.sh
 ```
 
-安装脚本会安装缺失的 Python 3 / nftables，下载程序和最新 APNIC 中国网段，建立开机服务，随后打开面板。也可下载仓库后在目录内运行 `bash install.sh`。安装失败时不会启用开机服务。
+安装脚本会安装缺失的 Python 3 / nftables，下载程序和 APNIC 中国网段，建立开机服务，随后打开面板。也可下载仓库后在目录内运行 `bash install.sh`。安装失败时不会启用开机服务。
+
+网段优先从 APNIC 官方源站获取，最多等待 **30 秒**；源站超时或失败时，自动通过 `gh-proxy.com`、`gh-proxy.org` 读取本仓库的 **APNIC CN 网段快照**。镜像文件使用固定 SHA-256 校验，不接受被修改的内容。镜像是仓库内的固定快照（当前 APNIC 数据日期 `2026-10-31`），不是实时 APNIC 数据；以后运行 `geofw geo-update` 仍会先尝试官方源站。两个镜像都不可用时会明确报错，不会用空网段覆盖规则。
 
 以后输入 `geofw` 即可打开面板；`geofw list` 查看配置，`geofw apply` 手动核对并修复，`geofw geo-update` 手动更新国内网段。systemd 系统每 10 分钟核对一次当前规则；**不会自动更新地域网段或自动删除规则**。OpenRC 系统在开机时核对，防火墙服务重载后可手动运行 `geofw apply`。
 
@@ -59,7 +61,7 @@ geofw geo-update
 
 规则保存在 `/etc/geofw/rules.json`，国内 IPv4 / IPv6 网段和来源时间保存在 `/var/lib/geofw/cn.json`，均仅允许 root 访问。程序只维护独立的 `inet geofw_managed` nftables 表；每次应用先检查版本标记和规则，正确时不会重复添加，有变化才原子替换本项目的表。删除某条规则时按列表编号选择，不清空其他防火墙规则。
 
-这里的“国内”明确指**中国大陆**：APNIC 官方 `delegated-apnic-latest` 中标记为 `CN` 的 IPv4 / IPv6 分配记录。港澳台在地址数据中使用独立代码，当前不计入 `CN`。“国外”指**不在这份 CN 分配列表中的公网地址**，不等于实时物理位置；代理、CDN、跨境分配和更新滞后可能造成差异。安装时会获取一次，之后由管理员用 `geofw geo-update` 手动刷新。无法取得有效的 IPv4 与 IPv6 数据时，程序拒绝应用地域规则。
+这里的“国内”明确指**中国大陆**：APNIC 官方 `delegated-apnic-latest` 中标记为 `CN` 的 IPv4 / IPv6 分配记录。港澳台在地址数据中使用独立代码，当前不计入 `CN`。“国外”指**不在这份 CN 分配列表中的公网地址**，不等于实时物理位置；代理、CDN、跨境分配和更新滞后可能造成差异。安装时会获取一次，之后由管理员用 `geofw geo-update` 手动刷新。源站不可用时使用仓库中的已校验快照，无法取得有效的 IPv4 与 IPv6 数据时仍拒绝应用地域规则。
 
 ## 使用前核对
 

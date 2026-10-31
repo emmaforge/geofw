@@ -12,6 +12,7 @@ from unittest import mock
 
 
 SOURCE = Path(__file__).resolve().parents[1] / "geofw"
+MIRROR_DATA = SOURCE.parent / "data" / "apnic-cn.txt"
 loader = importlib.machinery.SourceFileLoader("geofw", str(SOURCE))
 spec = importlib.util.spec_from_loader(loader.name, loader)
 geofw = importlib.util.module_from_spec(spec)
@@ -56,6 +57,47 @@ class GeoFirewallTests(unittest.TestCase):
         self.assertNotIn("8.8.8.0/24", cn4)
         with self.assertRaisesRegex(ValueError, "数据不足"):
             geofw.parse_apnic("\n".join(rows[:120]))
+
+    def test_mirror_snapshot_matches_pinned_digest(self):
+        payload = MIRROR_DATA.read_bytes()
+        self.assertEqual(hashlib.sha256(payload).hexdigest(), geofw.APNIC_MIRROR_SHA256)
+        cn4, cn6 = geofw.parse_apnic(payload.decode("ascii"))
+        self.assertGreater(len(cn4), 5000)
+        self.assertGreater(len(cn6), 1900)
+
+    def test_full_apnic_rejects_partial_source_response(self):
+        rows = [f"apnic|CN|ipv4|1.0.{i * 2}.0|256|20261030|allocated"
+                for i in range(120)]
+        rows += [f"apnic|CN|ipv6|240e:0:{i * 2:x}::|48|20261030|allocated"
+                 for i in range(120)]
+        complete = "2|apnic|20261031|240|19830613|20261030|+1000\n" + "\n".join(rows)
+        self.assertEqual(len(geofw.parse_full_apnic(complete)[0]), 120)
+        with self.assertRaisesRegex(ValueError, "数据不完整"):
+            geofw.parse_full_apnic(complete.rsplit("\n", 1)[0])
+
+    def test_apnic_source_timeout_falls_back_to_verified_mirror(self):
+        payload = MIRROR_DATA.read_bytes()
+        calls = []
+        def download(url, seconds, max_bytes):
+            calls.append((url, seconds))
+            if url == geofw.APNIC_URL:
+                raise TimeoutError("source timed out")
+            return payload
+        with mock.patch.object(geofw, "download_data", side_effect=download), \
+             mock.patch.object(geofw, "APNIC_MIRROR_URLS", ("https://mirror.test/cn",)):
+            cn4, cn6, source, source_date = geofw.fetch_apnic()
+        self.assertEqual(calls, [(geofw.APNIC_URL, 30), ("https://mirror.test/cn", 20)])
+        self.assertEqual(source_date, geofw.APNIC_MIRROR_DATE)
+        self.assertEqual(source, "https://mirror.test/cn")
+        self.assertGreater(len(cn4), 5000)
+        self.assertGreater(len(cn6), 1900)
+
+    def test_mirror_rejects_modified_snapshot(self):
+        with mock.patch.object(geofw, "download_data", side_effect=[TimeoutError("source timed out"),
+                                                                    b"altered"]), \
+             mock.patch.object(geofw, "APNIC_MIRROR_URLS", ("https://mirror.test/cn",)):
+            with self.assertRaisesRegex(ValueError, "镜像快照 SHA-256 校验失败"):
+                geofw.fetch_apnic()
 
     def test_allow_cn_blocks_other_new_ipv4_connections(self):
         table, comments = geofw.render_table([self.rule()], self.cn4, self.cn6)

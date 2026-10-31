@@ -2,3 +2,4 @@ geofw text eol=lf
 *.sh text eol=lf
 *.md text eol=lf
 *.py text eol=lf
+data/apnic-cn.txt text eol=lf
