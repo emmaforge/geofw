@@ -1,0 +1,4 @@
+__pycache__/
+*.pyc
+.apnic-test.txt
+.nft-test.nft

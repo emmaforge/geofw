@@ -1,0 +1,555 @@
+#!/usr/bin/env python3
+"""geofw: country-aware IPv4/IPv6 firewall rules in a private nftables table."""
+
+import argparse
+import contextlib
+import datetime as dt
+import hashlib
+import ipaddress
+import json
+import os
+from pathlib import Path
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+import urllib.request
+
+TABLE = "geofw_managed"
+APNIC_URL = "https://ftp.apnic.net/stats/apnic/delegated-apnic-latest"
+CONFIG_DIR = Path(os.environ.get("GEOFW_CONFIG_DIR", "/etc/geofw"))
+DATA_DIR = Path(os.environ.get("GEOFW_DATA_DIR", "/var/lib/geofw"))
+LOCK_PATH = Path(os.environ.get("GEOFW_LOCK_PATH", "/run/lock/geofw.lock"))
+RULES_PATH = CONFIG_DIR / "rules.json"
+GEO_PATH = DATA_DIR / "cn.json"
+
+FAMILIES = {"ipv4": (4,), "ipv6": (6,), "dual": (4, 6)}
+DIRECTIONS = {"in": ("input",), "out": ("output",), "both": ("input", "output")}
+PROTOCOLS = {"tcp": ("tcp",), "udp": ("udp",), "both": ("tcp", "udp")}
+GEO = {"cn": "国内", "foreign": "国外", "all": "全部"}
+ACTIONS = {"allow": "放行", "block": "阻断"}
+NONPUBLIC4 = ("0.0.0.0/8", "10.0.0.0/8", "100.64.0.0/10", "127.0.0.0/8",
+              "169.254.0.0/16", "172.16.0.0/12", "192.0.0.0/24", "192.0.2.0/24",
+              "192.168.0.0/16", "198.18.0.0/15", "198.51.100.0/24",
+              "203.0.113.0/24", "224.0.0.0/4", "240.0.0.0/4")
+NONPUBLIC6 = ("::/128", "::1/128", "::ffff:0:0/96", "100::/64",
+              "2001:db8::/32", "fc00::/7", "fe80::/10", "ff00::/8")
+
+
+def fail(message):
+    raise ValueError(message)
+
+
+def paint(text, code):
+    if sys.stdout.isatty() and not os.environ.get("NO_COLOR"):
+        return f"\033[{code}m{text}\033[0m"
+    return text
+
+
+def require_root():
+    if os.geteuid() == 0:
+        return
+    if shutil.which("sudo"):
+        os.execvp("sudo", ["sudo", sys.executable, os.path.realpath(__file__), *sys.argv[1:]])
+    fail("需要 root 权限；当前系统未安装 sudo。")
+
+
+@contextlib.contextmanager
+def locked():
+    import fcntl  # Linux only
+
+    LOCK_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with LOCK_PATH.open("w") as handle:
+        fcntl.flock(handle, fcntl.LOCK_EX)
+        yield
+
+
+def atomic_text(path, text, mode=0o600):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    try:
+        os.fchmod(fd, mode)
+        with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as handle:
+            handle.write(text)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(name, path)
+    finally:
+        if os.path.exists(name):
+            os.unlink(name)
+
+
+def parse_ports(value):
+    if not isinstance(value, str) or not value.strip():
+        fail("端口不能为空；格式如 80,443,2000-2999。")
+    intervals = []
+    for token in value.split(","):
+        match = re.fullmatch(r"\s*(\d{1,5})(?:\s*-\s*(\d{1,5}))?\s*", token)
+        if not match:
+            fail(f"端口格式无效：{token!r}。")
+        start = int(match.group(1))
+        end = int(match.group(2) or match.group(1))
+        if not (1 <= start <= end <= 65535):
+            fail(f"端口超出范围或起止颠倒：{token!r}。")
+        intervals.append((start, end))
+    intervals.sort()
+    merged = []
+    for start, end in intervals:
+        if merged and start <= merged[-1][1] + 1:
+            merged[-1] = (merged[-1][0], max(end, merged[-1][1]))
+        else:
+            merged.append((start, end))
+    return merged
+
+
+def port_text(intervals):
+    return ",".join(str(a) if a == b else f"{a}-{b}" for a, b in intervals)
+
+
+def port_expr(intervals):
+    parts = [str(a) if a == b else f"{a}-{b}" for a, b in intervals]
+    return parts[0] if len(parts) == 1 else "{ " + ", ".join(parts) + " }"
+
+
+def normalize_rule(rule):
+    if not isinstance(rule, dict) or not isinstance(rule.get("id"), int) or rule["id"] < 1:
+        fail("规则编号无效。")
+    for field, choices in (("family", FAMILIES), ("direction", DIRECTIONS),
+                           ("protocol", PROTOCOLS), ("geo", GEO), ("action", ACTIONS)):
+        if rule.get(field) not in choices:
+            fail(f"规则 #{rule['id']} 的 {field} 无效。")
+    rule = dict(rule)
+    rule["ports"] = port_text(parse_ports(rule.get("ports")))
+    return {key: rule[key] for key in ("id", "family", "direction", "protocol", "ports", "geo", "action")}
+
+
+def overlap(left, right):
+    if not set(FAMILIES[left["family"]]) & set(FAMILIES[right["family"]]):
+        return False
+    if not set(DIRECTIONS[left["direction"]]) & set(DIRECTIONS[right["direction"]]):
+        return False
+    if not set(PROTOCOLS[left["protocol"]]) & set(PROTOCOLS[right["protocol"]]):
+        return False
+    return any(a <= d and c <= b for a, b in parse_ports(left["ports"])
+               for c, d in parse_ports(right["ports"]))
+
+
+def validate_rules(raw):
+    if not isinstance(raw, list):
+        fail("规则配置必须是数组。")
+    rules = [normalize_rule(rule) for rule in raw]
+    for index, rule in enumerate(rules):
+        if any(rule["id"] == other["id"] for other in rules[:index]):
+            fail(f"规则编号 #{rule['id']} 重复。")
+        for other in rules[:index]:
+            if overlap(rule, other):
+                fail(f"规则 #{rule['id']} 与 #{other['id']} 的协议、方向和端口重叠。")
+    return rules
+
+
+def read_rules():
+    if not RULES_PATH.exists():
+        return []
+    try:
+        return validate_rules(json.loads(RULES_PATH.read_text(encoding="utf-8")))
+    except (json.JSONDecodeError, UnicodeError) as exc:
+        fail(f"规则配置损坏：{exc}")
+
+
+def save_rules(rules):
+    atomic_text(RULES_PATH, json.dumps(validate_rules(rules), ensure_ascii=False, indent=2) + "\n")
+
+
+def parse_apnic(text):
+    v4, v6 = [], []
+    for line in text.splitlines():
+        fields = line.split("|")
+        if len(fields) < 7 or fields[0].lower() != "apnic" or fields[1] != "CN":
+            continue
+        kind, start, size, status = fields[2], fields[3], fields[4], fields[6]
+        if status not in {"allocated", "assigned", "legacy"}:
+            continue
+        if kind == "ipv4":
+            first = ipaddress.IPv4Address(start)
+            count = int(size)
+            if count < 1:
+                fail("APNIC IPv4 记录数量无效。")
+            last = ipaddress.IPv4Address(int(first) + count - 1)
+            v4.extend(ipaddress.summarize_address_range(first, last))
+        elif kind == "ipv6":
+            v6.append(ipaddress.IPv6Network(f"{start}/{int(size)}", strict=False))
+    v4 = list(ipaddress.collapse_addresses(v4))
+    v6 = list(ipaddress.collapse_addresses(v6))
+    if len(v4) < 100 or len(v6) < 100 or any(net.prefixlen == 0 for net in (*v4, *v6)):
+        fail("APNIC 国内 IPv4/IPv6 数据不足或异常，拒绝替换现有网段。")
+    return [str(net) for net in v4], [str(net) for net in v6]
+
+
+def read_geo():
+    if not GEO_PATH.exists():
+        fail("尚无国内网段数据；先运行 geofw geo-update。")
+    data = json.loads(GEO_PATH.read_text(encoding="utf-8"))
+    if not isinstance(data, dict):
+        fail("国内网段缓存格式错误。")
+    meta = data.get("meta", {})
+    if not isinstance(meta, dict) or not meta.get("sha256"):
+        fail("国内网段缓存缺少完整性校验。")
+    result = []
+    for key, version in (("cn4", 4), ("cn6", 6)):
+        lines = data.get(key, [])
+        if not isinstance(lines, list) or len(lines) < 100:
+            fail(f"{key} 数据不足。")
+        if any(not isinstance(line, str) or ipaddress.ip_network(line).version != version
+               or ipaddress.ip_network(line).prefixlen == 0
+               for line in lines):
+            fail(f"{key} 地址族不匹配。")
+        result.append(lines)
+    expected = hashlib.sha256(("\n".join(result[0]) + "\n--\n" +
+                               "\n".join(result[1])).encode()).hexdigest()
+    if meta["sha256"] != expected:
+        fail("国内网段缓存校验失败，请运行 geofw geo-update。")
+    return tuple(result)
+
+
+def render_table(rules, cn4, cn6):
+    rules = validate_rules(rules)
+    geo_hash = hashlib.sha256(("\n".join(cn4) + "\n--\n" + "\n".join(cn6) +
+                               "\n--\n" + "\n".join(NONPUBLIC4 + NONPUBLIC6)).encode()).hexdigest()
+    revision = hashlib.sha256((json.dumps(rules, sort_keys=True) + geo_hash).encode()).hexdigest()[:20]
+    chains = {"input": [], "output": []}
+    comments = {"input": [], "output": []}
+    for chain in chains:
+        comment = f"geofw:revision:{revision}:{chain}"
+        chains[chain].append(f'    counter comment "{comment}"')
+        comments[chain].append(comment)
+        comment = f"geofw:established:{chain}"
+        chains[chain].append(f'    ct state established,related accept comment "{comment}"')
+        comments[chain].append(comment)
+    for rule in rules:
+        ports = port_expr(parse_ports(rule["ports"]))
+        for chain in DIRECTIONS[rule["direction"]]:
+            address = "saddr" if chain == "input" else "daddr"
+            for proto in PROTOCOLS[rule["protocol"]]:
+                for version in FAMILIES[rule["family"]]:
+                    ip_family = "ip" if version == 4 else "ip6"
+                    set_name = "cn4" if version == 4 else "cn6"
+                    base = f"{proto} dport {ports}"
+                    match = f"{ip_family} {address} @{set_name}"
+                    foreign = (f"{ip_family} {address} != @{set_name} "
+                               f"{ip_family} {address} != @local{version}")
+                    fallback = f"meta nfproto ipv{version}"
+                    prefix = f"geofw:rule:{rule['id']}:{chain}:{proto}:{version}"
+                    if rule["geo"] == "all":
+                        specs = [(fallback, rule["action"])]
+                    elif rule["action"] == "allow":
+                        specs = ([(match, "allow"), (foreign, "block")]
+                                 if rule["geo"] == "cn" else
+                                 [(foreign, "allow"), (match, "block")])
+                    else:
+                        specs = [(match if rule["geo"] == "cn" else foreign, "block")]
+                    for part, (condition, action) in enumerate(specs):
+                        verdict = "accept" if action == "allow" else "drop"
+                        comment = f"{prefix}:{part}"
+                        chains[chain].append(f'    {base} {condition} counter {verdict} comment "{comment}"')
+                        comments[chain].append(comment)
+    def set_block(name, kind, networks):
+        elements = ",\n      ".join(networks)
+        return f"  set {name} {{\n    type {kind}\n    flags interval\n    auto-merge\n    elements = {{\n      {elements}\n    }}\n  }}"
+    lines = [f"table inet {TABLE} {{", set_block("cn4", "ipv4_addr", cn4),
+             set_block("cn6", "ipv6_addr", cn6),
+             set_block("local4", "ipv4_addr", NONPUBLIC4),
+             set_block("local6", "ipv6_addr", NONPUBLIC6)]
+    for chain in ("input", "output"):
+        body = "\n".join(chains[chain])
+        lines.append(f"  chain {chain} {{\n    type filter hook {chain} priority -10; policy accept;\n{body}\n  }}")
+    lines.append("}")
+    ordered_comments = [(chain, comment) for chain in ("input", "output")
+                        for comment in comments[chain]]
+    return "\n".join(lines) + "\n", ordered_comments
+
+
+def nft_snapshot():
+    result = subprocess.run(["nft", "-j", "list", "table", "inet", TABLE],
+                            capture_output=True, text=True, check=False)
+    if result.returncode:
+        return None
+    return json.loads(result.stdout)
+
+
+def nft_current(snapshot, comments):
+    if snapshot is None:
+        return False
+    entries = snapshot.get("nftables", [])
+    actual = [(item["rule"].get("chain"), item["rule"].get("comment"))
+              for item in entries if "rule" in item]
+    sets = {item["set"].get("name"): item["set"].get("elem", [])
+            for item in entries if "set" in item}
+    return (actual == comments and all(bool(sets.get(name)) for name in
+                                       ("cn4", "cn6", "local4", "local6")))
+
+
+def apply_rules(rules, cn4, cn6, quiet=False):
+    if not shutil.which("nft"):
+        fail("找不到 nft 命令，请先运行安装脚本。")
+    table, comments = render_table(rules, cn4, cn6)
+    snapshot = nft_snapshot()
+    if nft_current(snapshot, comments):
+        if not quiet:
+            print("IPv4/IPv6 规则已核对，无需重复部署。")
+        return False
+    if snapshot is not None:
+        entries = snapshot.get("nftables", [])
+        owned = any(item.get("set", {}).get("name") in
+                    {"cn4", "cn6", "local4", "local6"} or
+                    str(item.get("rule", {}).get("comment", "")).startswith("geofw:")
+                    for item in entries)
+        if not owned:
+            fail(f"发现同名但非 geofw 管理的 nftables 表 {TABLE}，拒绝覆盖。")
+    batch = (f"delete table inet {TABLE}\n" if snapshot is not None else "") + table
+    checked = subprocess.run(["nft", "-c", "-f", "-"], input=batch,
+                             capture_output=True, text=True, check=False)
+    if checked.returncode:
+        fail(f"nftables 规则检查失败：{checked.stderr.strip()}")
+    applied = subprocess.run(["nft", "-f", "-"], input=batch,
+                             capture_output=True, text=True, check=False)
+    if applied.returncode:
+        fail(f"nftables 应用失败：{applied.stderr.strip()}")
+    if not quiet:
+        print("IPv4/IPv6 规则已应用或修复。")
+    return True
+
+
+def update_rules(candidate):
+    with locked():
+        before = read_rules()
+        candidate = validate_rules(candidate(before))
+        if candidate == before:
+            cn4, cn6 = read_geo()
+            apply_rules(before, cn4, cn6)
+            return False
+        cn4, cn6 = read_geo()
+        apply_rules(candidate, cn4, cn6)
+        try:
+            save_rules(candidate)
+        except Exception:
+            apply_rules(before, cn4, cn6, quiet=True)
+            raise
+        return True
+
+
+def geo_update():
+    with locked():
+        request = urllib.request.Request(APNIC_URL, headers={"User-Agent": "geofw/1.0"})
+        with urllib.request.urlopen(request, timeout=30) as response:
+            payload = response.read(20_000_001)
+        if len(payload) > 20_000_000:
+            fail("APNIC 文件超过预期大小，拒绝更新。")
+        cn4, cn6 = parse_apnic(payload.decode("ascii"))
+        rules = read_rules()
+        old_geo = None
+        try:
+            old_geo = read_geo()
+        except (ValueError, FileNotFoundError):
+            pass
+        apply_rules(rules, cn4, cn6)
+        try:
+            checksum = hashlib.sha256(("\n".join(cn4) + "\n--\n" +
+                                       "\n".join(cn6)).encode()).hexdigest()
+            meta = {"source": APNIC_URL, "updated_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+                    "ipv4_prefixes": len(cn4), "ipv6_prefixes": len(cn6), "sha256": checksum}
+            atomic_text(GEO_PATH, json.dumps({"meta": meta, "cn4": cn4, "cn6": cn6},
+                                             ensure_ascii=False, separators=(",", ":")) + "\n")
+        except Exception:
+            if old_geo:
+                apply_rules(rules, *old_geo, quiet=True)
+            raise
+        print(f"国内网段已更新：IPv4 {len(cn4)} 条，IPv6 {len(cn6)} 条。")
+
+
+def format_rule(rule):
+    family = {"ipv4": "IPv4", "ipv6": "IPv6", "dual": "双栈"}[rule["family"]]
+    direction = {"in": "入站", "out": "出站", "both": "双向"}[rule["direction"]]
+    protocol = {"tcp": "TCP", "udp": "UDP", "both": "TCP+UDP"}[rule["protocol"]]
+    action = ACTIONS[rule["action"]]
+    if rule["action"] == "allow" and rule["geo"] != "all":
+        action += "（其他地域阻断）"
+    return (f"  [#{rule['id']}] {family} / {direction} / {protocol}\n"
+            f"       目标端口：{rule['ports']}\n"
+            f"       匹配地域：{GEO[rule['geo']]}\n"
+            f"       执行动作：{action}")
+
+
+def show_rules():
+    rules = read_rules()
+    try:
+        cn4, cn6 = read_geo()
+        _, comments = render_table(rules, cn4, cn6)
+        state = "已校验" if nft_current(nft_snapshot(), comments) else "缺失或有变动，请运行 geofw apply"
+    except ValueError as exc:
+        state = str(exc)
+    print("\n" + "=" * 34)
+    print(paint("  geofw  当前规则", "1;36"))
+    print("-" * 34)
+    print(f"  规则数量：{len(rules)}")
+    print(f"  运行状态：{paint(state, '32' if state == '已校验' else '33')}")
+    if GEO_PATH.exists():
+        try:
+            meta = json.loads(GEO_PATH.read_text(encoding="utf-8")).get("meta", {})
+            updated = meta.get("updated_at", "未知")
+            try:
+                updated = dt.datetime.fromisoformat(updated).astimezone().strftime("%Y-%m-%d %H:%M")
+            except ValueError:
+                pass
+            print(f"  网段更新：{updated}")
+        except (ValueError, AttributeError):
+            print("  网段更新：缓存文件异常")
+    if not rules:
+        print("-" * 34)
+        print("  当前没有规则。")
+    for rule in rules:
+        print("-" * 34)
+        print(format_rule(rule))
+    print("=" * 34)
+
+
+def add_rule(family, direction, protocol, ports, geo, action):
+    new = normalize_rule({"id": 1, "family": family, "direction": direction,
+                          "protocol": protocol, "ports": ports, "geo": geo, "action": action})
+    def candidate(before):
+        equivalent = [{key: value for key, value in old.items() if key != "id"} ==
+                      {key: value for key, value in new.items() if key != "id"} for old in before]
+        if any(equivalent):
+            print("相同规则已存在，仅核对当前防火墙。")
+            return before
+        new["id"] = max((old["id"] for old in before), default=0) + 1
+        return before + [new]
+    if update_rules(candidate):
+        print(f"已添加规则 #{new['id']}。")
+
+
+def delete_rule(rule_id):
+    def candidate(before):
+        remaining = [rule for rule in before if rule["id"] != rule_id]
+        if len(remaining) == len(before):
+            fail(f"找不到规则 #{rule_id}。")
+        return remaining
+    update_rules(candidate)
+    print(f"已删除规则 #{rule_id}。")
+
+
+def choice(label, mapping):
+    print(f"\n--- {label} ---")
+    for key, (name, _) in mapping.items():
+        print(f"  [{key}] {name}")
+    answer = input("请选择：").strip()
+    if answer not in mapping:
+        fail("选项无效。")
+    return mapping[answer][1]
+
+
+def menu():
+    families = {"1": ("IPv4", "ipv4"), "2": ("IPv6", "ipv6"), "3": ("双栈", "dual")}
+    directions = {"1": ("入站", "in"), "2": ("出站", "out"), "3": ("双向", "both")}
+    protocols = {"1": ("TCP", "tcp"), "2": ("UDP", "udp"), "3": ("两者", "both")}
+    regions = {"1": ("仅国内", "cn"), "2": ("仅国外", "foreign"), "3": ("全部地址", "all")}
+    actions = {"1": ("放行", "allow"), "2": ("阻断", "block")}
+    while True:
+        print("\n" + "=" * 34)
+        print(paint("  geofw  地域防火墙面板", "1;36"))
+        print("-" * 34)
+        print("  [1] 添加防火墙规则")
+        print("  [2] 查看当前规则")
+        print("  [3] 删除指定规则")
+        print("  [4] 核对并修复规则")
+        print("  [5] 更新国内网段")
+        print("  [0] 退出面板")
+        print("=" * 34)
+        try:
+            option = input("请选择：").strip()
+            if option == "0":
+                return
+            if option == "1":
+                family = choice("地址族", families)
+                direction = choice("方向", directions)
+                protocol = choice("协议", protocols)
+                ports = port_text(parse_ports(input("目标端口（如 80,443,2000-2999）：")))
+                geo = choice("地域", regions)
+                action = choice("动作", actions)
+                preview = normalize_rule({"id": 1, "family": family, "direction": direction,
+                                          "protocol": protocol, "ports": ports, "geo": geo, "action": action})
+                print("\n" + "-" * 34)
+                print(paint("  请确认以下规则", "1;36"))
+                print(format_rule(preview))
+                print("-" * 34)
+                if action == "allow" and geo != "all":
+                    print("提示：其他地域的新连接会被阻断。")
+                if direction in ("in", "both") and protocol in ("tcp", "both"):
+                    ssh_parts = os.environ.get("SSH_CONNECTION", "").split()
+                    ssh_port = int(ssh_parts[-1]) if len(ssh_parts) == 4 and ssh_parts[-1].isdigit() else 22
+                    if any(a <= ssh_port <= b for a, b in parse_ports(ports)):
+                        print(paint("警告：规则涉及 SSH 端口，可能阻断新的远程登录。", "1;33"))
+                if input("确认应用？输入 yes：").strip() == "yes":
+                    add_rule(family, direction, protocol, ports, geo, action)
+                else:
+                    print("已取消。")
+            elif option == "2":
+                show_rules()
+            elif option == "3":
+                show_rules()
+                raw = input("要删除的规则编号（回车取消）：").strip()
+                if raw:
+                    if input(f"确认删除 #{raw}？输入 yes：").strip() == "yes":
+                        delete_rule(int(raw))
+                    else:
+                        print("已取消。")
+            elif option == "4":
+                with locked():
+                    apply_rules(read_rules(), *read_geo())
+            elif option == "5":
+                geo_update()
+            else:
+                print("选项无效。")
+        except (ValueError, OSError, subprocess.SubprocessError) as exc:
+            print(f"错误：{exc}", file=sys.stderr)
+        except EOFError:
+            return
+
+
+def main():
+    parser = argparse.ArgumentParser(description="geofw：国内/国外双栈防火墙面板")
+    sub = parser.add_subparsers(dest="command")
+    add = sub.add_parser("add", help="添加规则")
+    for name, choices in (("family", FAMILIES), ("direction", DIRECTIONS),
+                          ("protocol", PROTOCOLS), ("geo", GEO), ("action", ACTIONS)):
+        add.add_argument(f"--{name}", required=True, choices=choices)
+    add.add_argument("--ports", required=True, help="目标端口，如 80,443,2000-2999")
+    delete = sub.add_parser("delete", help="删除指定编号")
+    delete.add_argument("id", type=int)
+    sub.add_parser("list", help="查看配置和状态")
+    sub.add_parser("apply", help="核对并修复规则")
+    sub.add_parser("geo-update", help="从 APNIC 更新国内网段")
+    args = parser.parse_args()
+    require_root()
+    try:
+        if args.command in (None, "menu"):
+            menu()
+        elif args.command == "add":
+            add_rule(args.family, args.direction, args.protocol, args.ports, args.geo, args.action)
+        elif args.command == "delete":
+            delete_rule(args.id)
+        elif args.command == "list":
+            show_rules()
+        elif args.command == "apply":
+            with locked():
+                apply_rules(read_rules(), *read_geo())
+        elif args.command == "geo-update":
+            geo_update()
+    except (ValueError, OSError, subprocess.SubprocessError) as exc:
+        print(f"错误：{exc}", file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
