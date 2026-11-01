@@ -1,4 +1,4 @@
-# APNIC delegated-apnic-latest CN IPv4/IPv6 snapshot 20261101
+# APNIC delegated-apnic-latest CN IPv4/IPv6 snapshot 20261102
 apnic|CN|ipv4|1.0.1.0|256|20110414|allocated
 apnic|CN|ipv4|1.0.2.0|512|20110414|allocated
 apnic|CN|ipv4|1.0.8.0|2048|20110412|allocated
