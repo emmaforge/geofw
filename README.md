@@ -9,13 +9,13 @@
 使用 `curl`：
 
 ```bash
-curl -fsSLo /tmp/install-geofw.sh https://raw.githubusercontent.com/zzx327317-creator/geofw/main/install.sh && bash /tmp/install-geofw.sh
+curl -fsSLo /tmp/install-geofw.sh https://raw.githubusercontent.com/emmaforge/geofw/main/install.sh && bash /tmp/install-geofw.sh
 ```
 
 使用 `wget`：
 
 ```bash
-wget -qO /tmp/install-geofw.sh https://raw.githubusercontent.com/zzx327317-creator/geofw/main/install.sh && bash /tmp/install-geofw.sh
+wget -qO /tmp/install-geofw.sh https://raw.githubusercontent.com/emmaforge/geofw/main/install.sh && bash /tmp/install-geofw.sh
 ```
 
 安装脚本会安装缺失的 Python 3 / nftables，下载程序和 APNIC 中国网段，建立开机服务，随后打开面板。也可下载仓库后在目录内运行 `bash install.sh`。安装失败时不会启用开机服务。

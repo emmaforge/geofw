@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-REPO_RAW=https://raw.githubusercontent.com/zzx327317-creator/geofw/main
+REPO_RAW=https://raw.githubusercontent.com/emmaforge/geofw/main
 INSTALL_BIN=/usr/local/bin/geofw
 
 die() { printf '安装失败：%s\n' "$*" >&2; exit 1; }

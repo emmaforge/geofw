@@ -21,7 +21,7 @@ import urllib.request
 TABLE = "geofw_managed"
 APNIC_URL = "https://ftp.apnic.net/stats/apnic/delegated-apnic-latest"
 APNIC_MIRROR_DATE = "20261102"
-APNIC_MIRROR_RAW = ("https://raw.githubusercontent.com/zzx327317-creator/geofw/"
+APNIC_MIRROR_RAW = ("https://raw.githubusercontent.com/emmaforge/geofw/"
                     f"apnic-{APNIC_MIRROR_DATE}/data/apnic-cn.txt")
 APNIC_MIRROR_URLS = (
     "https://gh-proxy.com/" + APNIC_MIRROR_RAW,
