@@ -20,14 +20,14 @@ import urllib.request
 
 TABLE = "geofw_managed"
 APNIC_URL = "https://ftp.apnic.net/stats/apnic/delegated-apnic-latest"
-APNIC_MIRROR_DATE = "20261110"
+APNIC_MIRROR_DATE = "20261111"
 APNIC_MIRROR_RAW = ("https://raw.githubusercontent.com/emmaforge/geofw/"
                     f"apnic-{APNIC_MIRROR_DATE}/data/apnic-cn.txt")
 APNIC_MIRROR_URLS = (
     "https://gh-proxy.com/" + APNIC_MIRROR_RAW,
     "https://gh-proxy.org/" + APNIC_MIRROR_RAW,
 )
-APNIC_MIRROR_SHA256 = "50bc4063e6437c86f7b6bf67db8737574f5b5df8f10c01a69ca752cdf3f79ff2"
+APNIC_MIRROR_SHA256 = "f7decd99775e8c0d8c98e8f8460dc55141c37754504834e5709870e6407c2f73"
 CONFIG_DIR = Path(os.environ.get("GEOFW_CONFIG_DIR", "/etc/geofw"))
 DATA_DIR = Path(os.environ.get("GEOFW_DATA_DIR", "/var/lib/geofw"))
 LOCK_PATH = Path(os.environ.get("GEOFW_LOCK_PATH", "/run/lock/geofw.lock"))
