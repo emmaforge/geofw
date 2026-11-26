@@ -1,4 +1,4 @@
-# APNIC delegated-apnic-latest CN IPv4/IPv6 snapshot 20261126
+# APNIC delegated-apnic-latest CN IPv4/IPv6 snapshot 20261127
 apnic|CN|ipv4|1.0.1.0|256|20110414|allocated
 apnic|CN|ipv4|1.0.2.0|512|20110414|allocated
 apnic|CN|ipv4|1.0.8.0|2048|20110412|allocated
@@ -3980,7 +3980,6 @@ apnic|CN|ipv4|103.158.0.0|512|20201030|allocated
 apnic|CN|ipv4|103.158.8.0|512|20201030|allocated
 apnic|CN|ipv4|103.158.16.0|512|20201102|allocated
 apnic|CN|ipv4|103.158.74.0|512|20230726|allocated
-apnic|CN|ipv4|103.158.190.0|512|20201117|allocated
 apnic|CN|ipv4|103.158.200.0|512|20201118|allocated
 apnic|CN|ipv4|103.158.224.0|512|20201118|allocated
 apnic|CN|ipv4|103.159.122.0|512|20201130|allocated
@@ -8874,7 +8873,6 @@ apnic|CN|ipv6|2001:df5:1440::|48|20250212|assigned
 apnic|CN|ipv6|2001:df5:2fc0::|48|20250306|assigned
 apnic|CN|ipv6|2001:df5:4740::|48|20250321|assigned
 apnic|CN|ipv6|2001:df5:4cc0::|48|20250331|assigned
-apnic|CN|ipv6|2001:df5:5f80::|48|20201117|assigned
 apnic|CN|ipv6|2001:df5:7800::|48|20140430|assigned
 apnic|CN|ipv6|2001:df6:40::|48|20250818|assigned
 apnic|CN|ipv6|2001:df6:100::|48|20180731|assigned
